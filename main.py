@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#djdj
 """
 Śledzenie markera ArUco + fallback CSRT
 – bbox o połowę mniejszy,
