@@ -136,11 +136,19 @@ class ArucoTracker:
         self.roi_expand = 1.6  # przy re-detect powiększamy ostatni bbox
 
         # --- BLUE ROI (łańcuch) + bezpieczeństwo ---
-        self.blue_roi = None                    # (x,y,w,h)
+        self.blue_roi = None                    # (x,y,w,h) – ROI do SZUKANIA (tylko po ArUco)
+        self.blue_vis = None                    # (x,y,w,h) – box do PODGLĄDU (LK/CSRT/ekstrap.)
         self.blue_roi_half = 40                 # stałe ±40 px od środka (podstawowe okno)
-        self.blue_roi_half_big = 80             # „winda bezpieczeństwa” po 1 missie
+        self.blue_roi_half_big = 160            # „winda bezpieczeństwa” po 1 missie (większa)
         self.blue_miss = 0                      # kolejne missy w BLUE ROI
-        self.anchor_every = 10                  # co N klatek próba full-frame kotwicy
+        self.anchor_every = 5                   # co N klatek próba pełnokadrowa (częściej)
+
+        # --- LK gating & pamięć pewnych pomiarów ---
+        self.lk_fb_thresh = 1.5                 # maks. błąd forward-backward [px]
+        self.lk_max_step = int(0.75 * self.blue_roi_half_big)  # maks. krok punktu/klatkę [px]
+        self.lk_bad_counter = 0                 # kolejne klatki z niewiarygodnym LK
+        self.last_good_c = None                 # ostatni wiarygodny czworokąt (4x2)
+        self.last_good_center = None            # i jego środek (cx, cy)
 
     def _detect_in_roi(self, frame: np.ndarray, bbox: Tuple[int,int,int,int], id_wanted: int | None):
         """Wykryj ArUco w powiększonym ROI wokół ostatniego bboxa.
@@ -156,7 +164,8 @@ class ArucoTracker:
         roi = frame[y1:y2, x1:x2]
         if roi.size == 0:
             return None, None
-        corners, ids, _ = self._detect(roi)
+        roi_p = self._preprocess_roi(roi)
+        corners, ids, _ = self._detect(roi_p)
         if ids is None or not len(ids):
             return None, None
         ids = ids.flatten()
@@ -177,13 +186,109 @@ class ArucoTracker:
         w = max(2, min(W - x, w)); h = max(2, min(H - y, h))
         return (int(x), int(y), int(w), int(h))
 
+    def _preprocess_roi(self, gray_roi: np.ndarray) -> np.ndarray:
+        """Wstępne przetwarzanie ROI w skali szarości: CLAHE + lekkie wyostrzenie.
+        Pomaga przy blikach wody i słabszym kontraście."""
+        if gray_roi is None or gray_roi.size == 0:
+            return gray_roi
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        g = clahe.apply(gray_roi)
+        blur = cv2.GaussianBlur(g, (3, 3), 0)
+        sharp = cv2.addWeighted(g, 1.5, blur, -0.5, 0)
+        return sharp
+
+    def _detect_multiscale(self, gray: np.ndarray, scales=(1.0, 1.25, 0.75)):
+        """Detekcja pełnokadrowa w kilku skalach. Zwraca (corners_4x2, id) albo (None, None)."""
+        for s in scales:
+            if s == 1.0:
+                img = gray
+            else:
+                interp = cv2.INTER_LINEAR if s > 1.0 else cv2.INTER_AREA
+                img = cv2.resize(gray, None, fx=s, fy=s, interpolation=interp)
+            corners, ids, _ = self._detect(img)
+            if ids is None or not len(ids):
+                continue
+            ids = ids.flatten()
+            idx = 0
+            if self.marker_id is not None:
+                matches = np.where(ids == self.marker_id)[0]
+                if len(matches) == 0:
+                    continue
+                idx = int(matches[0])
+            c = corners[idx][0].copy()
+            if s != 1.0:
+                c /= s
+            return c, int(ids[idx])
+        return None, None
+
+    def _lk_confidence(self, c_lk: np.ndarray, last_bbox: Tuple[int,int,int,int] | None) -> bool:
+        """Oceń czy kształt z LK wygląda jak kwadrat markera (w przybliżeniu)."""
+        if c_lk is None or len(c_lk) != 4:
+            return False
+        try:
+            if not cv2.isContourConvex(c_lk.astype(np.float32)):
+                return False
+        except Exception:
+            return False
+        d = [float(np.linalg.norm(c_lk[(i+1) % 4] - c_lk[i])) for i in range(4)]
+        mn = max(1e-6, min(d)); mx = max(d)
+        if mx / mn > 2.2:  # zbyt wydłużony
+            return False
+        area = float(cv2.contourArea(c_lk.astype(np.float32)))
+        if last_bbox is not None:
+            area_bbox = float(max(1, last_bbox[2] * last_bbox[3]))
+            ratio = area / area_bbox
+            if ratio < 0.25 or ratio > 4.0:
+                return False
+        return True
+
+    def _lk_fb_filter(self, prev_gray: np.ndarray, gray: np.ndarray,
+                      prev_pts: np.ndarray, next_pts: np.ndarray, st: np.ndarray):
+        """Forward–backward check + gating kroku i ROI.
+        Zwraca (next_pts_filtered, valid_mask) lub (None, None) jeśli za mało punktów.
+        """
+        if next_pts is None or st is None or prev_pts is None or prev_gray is None:
+            return None, None
+        st_f = (st.flatten() == 1)
+        if not np.any(st_f):
+            return None, None
+        # Oblicz ruch wsteczny
+        back_pts, st_b, _ = cv2.calcOpticalFlowPyrLK(
+            gray, prev_gray, next_pts, None,
+            winSize=self.lk_winSize, maxLevel=self.lk_maxLevel, criteria=self.lk_criteria
+        )
+        if back_pts is None:
+            return None, None
+        prev_flat = prev_pts.reshape(-1, 2)
+        next_flat = next_pts.reshape(-1, 2)
+        back_flat = back_pts.reshape(-1, 2)
+        fb_err = np.linalg.norm(prev_flat - back_flat, axis=1)
+        step = np.linalg.norm(next_flat - prev_flat, axis=1)
+        valid = st_f & (fb_err < self.lk_fb_thresh) & (step < self.lk_max_step)
+        # Gating do rozszerzonego ROI (jeśli mamy)
+        if self.blue_roi is not None:
+            bx, by, bw, bh = self.blue_roi
+            # rozszerz o 25%
+            ex = int(0.125 * bw); ey = int(0.125 * bh)
+            gx1, gy1 = max(0, bx - ex), max(0, by - ey)
+            gx2, gy2 = min(self.w - 1, bx + bw + ex), min(self.h - 1, by + bh + ey)
+            inside = (
+                (next_flat[:, 0] >= gx1) & (next_flat[:, 0] <= gx2) &
+                (next_flat[:, 1] >= gy1) & (next_flat[:, 1] <= gy2)
+            )
+            valid = valid & inside
+        if int(valid.sum()) < 3:
+            return None, None
+        return next_pts[valid].reshape(-1, 1, 2), valid
+
     def _detect_in_bbox(self, frame: np.ndarray, bbox: Tuple[int,int,int,int], id_wanted: int | None):
         """Wykryj ArUco w *dokładnym* bboxie (bez dodatkowego skalowania)."""
         x, y, w, h = bbox
         roi = frame[y:y+h, x:x+w]
         if roi.size == 0:
             return None, None
-        corners, ids, _ = self._detect(roi)
+        roi_p = self._preprocess_roi(roi)
+        corners, ids, _ = self._detect(roi_p)
         if ids is None or not len(ids):
             return None, None
         ids = ids.flatten()
@@ -216,6 +321,7 @@ class ArucoTracker:
             z_cm = None
             used_blue = False
             blue_updated = False
+            search_roi_moved = False
 
             # --- ŁAŃCUCHOWE WYSZUKIWANIE ---
             if self.blue_roi is not None:
@@ -232,45 +338,28 @@ class ArucoTracker:
                     bw = int(2*half); bh = int(2*half)
                     bx, by, bw, bh = self._clip_bbox(bx, by, bw, bh, self.w, self.h)
                     big_box = (bx, by, bw, bh)
+                    self.blue_vis = big_box
                     c_big, _ = self._detect_in_bbox(gray, big_box, self.marker_id)
                     if c_big is not None:
                         c = c_big; detected = True; used_blue = True; self.blue_miss = 0
                     else:
                         self.blue_miss += 1
-                        # 1b) Po 2 missach – kotwica pełnokadrowa
-                        if self.blue_miss >= 2:
-                            corners, ids, _ = self._detect(gray)
-                            if ids is not None and len(ids):
-                                ids = ids.flatten(); idx = 0
-                                if self.marker_id is not None:
-                                    matches = np.where(ids == self.marker_id)[0]
-                                    if len(matches): idx = int(matches[0])
-                                    else: ids = None
-                                if ids is not None and len(ids):
-                                    c = corners[idx][0]; detected = True; used_blue = False; self.blue_miss = 0
+                        # 1b) Po 1 missie – kotwica pełnokadrowa (szybszy powrót)
+                        if self.blue_miss >= 1:
+                            c_ff, id_ff = self._detect_multiscale(gray)
+                            if c_ff is not None:
+                                c = c_ff; detected = True; used_blue = False; self.blue_miss = 0
             else:
-                # 0) Pierwsza kotwica: pełny kadr
-                corners, ids, _ = self._detect(gray)
-                if ids is not None and len(ids):
-                    ids = ids.flatten(); idx = 0
-                    if self.marker_id is not None:
-                        matches = np.where(ids == self.marker_id)[0]
-                        if len(matches): idx = int(matches[0])
-                        else: ids = None
-                    if ids is not None and len(ids):
-                        c = corners[idx][0]; detected = True
+                # 0) Pierwsza kotwica: pełny kadr (multiskala)
+                c_full, id_full = self._detect_multiscale(gray)
+                if c_full is not None:
+                    c = c_full; detected = True
 
             # 0b) Dodatkowa kotwica co N klatek (gdy korzystaliśmy z BLUE ROI)
             if detected and used_blue and self.anchor_every and (frame_idx % self.anchor_every == 0):
-                corners_a, ids_a, _ = self._detect(gray)
-                if ids_a is not None and len(ids_a):
-                    ids_a = ids_a.flatten(); idx_a = 0
-                    if self.marker_id is not None:
-                        matches = np.where(ids_a == self.marker_id)[0]
-                        if len(matches): idx_a = int(matches[0])
-                        else: ids_a = None
-                    if ids_a is not None and len(ids_a):
-                        c = corners_a[idx_a][0]
+                c_a, id_a = self._detect_multiscale(gray)
+                if c_a is not None:
+                    c = c_a
 
             if detected and c is not None:
                 self.lost_counter = 0
@@ -321,14 +410,13 @@ class ArucoTracker:
                 cv2.circle(frame_vis, (int(cx), int(cy)), 4, (0, 0, 255), -1)
                 self.records.append((t, cx, cy, z_cm))
 
-                # --- AKTUALIZUJ BLUE ROI (zawsze) ---
+                # --- AKTUALIZUJ BLUE ROI (po ArUco) ---
                 half = self.blue_roi_half
                 bx = int(round(cx - half)); by = int(round(cy - half))
                 bw = int(2*half); bh = int(2*half)
-                self.blue_roi = self._clip_bbox(bx, by, bw, bh, self.w, self.h)
-                # rysuj niebieski box
-                x, y, w, h = self.blue_roi
-                cv2.rectangle(frame_vis, (x, y), (x + w, y + h), (255, 0, 0), 2)
+                self.blue_roi = self._clip_bbox(bx, by, bw, bh, self.w, self.h)   # ← TYLKO po udanym ArUco
+                self.blue_vis = self.blue_roi                                      # podgląd = to samo
+                search_roi_moved = True
                 blue_updated = True
 
             else:
@@ -342,58 +430,70 @@ class ArucoTracker:
                         winSize=self.lk_winSize, maxLevel=self.lk_maxLevel, criteria=self.lk_criteria
                     )
                     if next_pts is not None and st is not None:
-                        # Zachowujemy pełny porządek 4 narożników (tak jak w prev_pts)
-                        valid = st.flatten() == 1
-                        n_valid = int(valid.sum())
-                        if n_valid >= 3:
-                            used_lk = True
-                            curr_pts = self.prev_pts.copy()  # 4x1x2
-                            curr_pts[valid] = next_pts[valid]
+                        # Forward–backward + kroki + ROI gating
+                        next_f, valid_mask = self._lk_fb_filter(self.prev_gray, gray, self.prev_pts, next_pts, st)
+                        if next_f is not None:
+                            # Złóż pełny zestaw 4 punktów: aktualizuj tylko te, które przeszły filtr
+                            curr_pts = self.prev_pts.copy()
+                            curr_pts[valid_mask] = next_f
 
-                            if n_valid == 3:
-                                # Odtwórz brakujący narożnik z transformacji afinicznej (3 korespondencje)
-                                src = self.prev_pts[valid].reshape(3,2).astype(np.float32)
-                                dst = next_pts[valid].reshape(3,2).astype(np.float32)
-                                M = cv2.getAffineTransform(src, dst)  # 2x3
-                                miss_idx = int(np.where(~valid)[0][0])
-                                p = self.prev_pts[miss_idx,0].astype(np.float32)  # (x,y) poprzedni
+                            # Jeśli brakuje jednego narożnika – odtwarzamy go afinicznie
+                            if int(valid_mask.sum()) == 3:
+                                src = self.prev_pts[valid_mask].reshape(3,2).astype(np.float32)
+                                dst = next_f.reshape(3,2).astype(np.float32)
+                                M = cv2.getAffineTransform(src, dst)
+                                miss_idx = int(np.where(~valid_mask)[0][0])
+                                p = self.prev_pts[miss_idx,0].astype(np.float32)
                                 pred = (M @ np.array([p[0], p[1], 1.0], dtype=np.float32)).reshape(2)
                                 curr_pts[miss_idx,0] = pred
 
                             c_lk = curr_pts.reshape(-1, 2)
-                            cx = float(np.mean(c_lk[:, 0]))
-                            cy = float(np.mean(c_lk[:, 1]))
+                            conf = self._lk_confidence(c_lk, self.last_bbox)
+                            if conf:
+                                used_lk = True
+                                cx = float(np.mean(c_lk[:, 0])); cy = float(np.mean(c_lk[:, 1]))
 
-                            x_min, y_min = np.min(c_lk, axis=0)
-                            x_max, y_max = np.max(c_lk, axis=0)
-                            pad = 15
-                            x_min = max(0, int(x_min) - pad)
-                            y_min = max(0, int(y_min) - pad)
-                            x_max = min(self.w - 1, int(x_max) + pad)
-                            y_max = min(self.h - 1, int(y_max) + pad)
-                            bbox = (
-                                x_min, y_min, max(2, x_max - x_min), max(2, y_max - y_min)
-                            )
-                            self.last_bbox = bbox
+                                # Update bbox
+                                x_min, y_min = np.min(c_lk, axis=0)
+                                x_max, y_max = np.max(c_lk, axis=0)
+                                pad = 15
+                                x_min = max(0, int(x_min) - pad)
+                                y_min = max(0, int(y_min) - pad)
+                                x_max = min(self.w - 1, int(x_max) + pad)
+                                y_max = min(self.h - 1, int(y_max) + pad)
+                                self.last_bbox = (x_min, y_min, max(2, x_max - x_min), max(2, y_max - y_min))
 
-                            # update stanu LK (pełny zestaw 4 punktów)
-                            self.prev_gray = gray.copy()
-                            self.prev_pts = curr_pts
+                                # update stanu LK (pełny zestaw 4 punktów)
+                                self.prev_gray = gray.copy()
+                                self.prev_pts = curr_pts
 
-                            # rysowanie zawsze 4 punktów
-                            cv2.polylines(frame_vis, [c_lk.astype(int)], True, (0, 255, 255), 2)
-                            cv2.circle(frame_vis, (int(cx), int(cy)), 4, (0, 255, 255), -1)
-                            self.records.append((t, cx, cy, None))
-                            # Aktualizuj BLUE ROI na podstawie LK (co klatkę)
-                            half = self.blue_roi_half
-                            bx = int(round(cx - half)); by = int(round(cy - half))
-                            bw = int(2*half); bh = int(2*half)
-                            self.blue_roi = self._clip_bbox(bx, by, bw, bh, self.w, self.h)
-                            cv2.rectangle(frame_vis, (bx, by), (bx + bw, by + bh), (255, 0, 0), 2)
-                            blue_updated = True
-                            state = "LK"
+                                # rysowanie tylko gdy wiarygodne
+                                cv2.polylines(frame_vis, [c_lk.astype(int)], True, (0, 255, 255), 2)
+                                cv2.circle(frame_vis, (int(cx), int(cy)), 4, (0, 255, 255), -1)
+                                self.records.append((t, cx, cy, None))
+
+                                # wizualny BLUE BOX
+                                half = self.blue_roi_half
+                                bx = int(round(cx - half)); by = int(round(cy - half))
+                                bw = int(2*half); bh = int(2*half)
+                                self.blue_vis = self._clip_bbox(bx, by, bw, bh, self.w, self.h)
+                                blue_updated = True
+
+                                # pozwól LK przesunąć także *search ROI*
+                                half = self.blue_roi_half
+                                bx = int(round(cx - half)); by = int(round(cy - half))
+                                bw = int(2*half); bh = int(2*half)
+                                self.blue_roi = self._clip_bbox(bx, by, bw, bh, self.w, self.h)
+                                self.blue_vis = self.blue_roi
+                                search_roi_moved = True
+                                self.blue_miss = 0
+                                self.lk_bad_counter = 0
+                                self.last_good_c = c_lk.copy(); self.last_good_center = (cx, cy)
+                            else:
+                                # LK niewiarygodny: nie rysujemy igły, nie dopisujemy rekordów
+                                self.lk_bad_counter += 1
                         else:
-                            # Za mało punktów → wyłącz LK i przejdź do CSRT
+                            # Zbyt mało poprawnych punktów po filtracji
                             self.lk_active = False
                             self.prev_gray = None
                             self.prev_pts = None
@@ -415,12 +515,11 @@ class ArucoTracker:
                             cv2.rectangle(frame_vis, (x, y), (x + w, y + h), (255, 0, 0), 2)
                             cv2.circle(frame_vis, (int(cx), int(cy)), 4, (255, 0, 0), -1)
                             self.records.append((t, cx, cy, None))
-                            # Aktualizuj BLUE ROI z CSRT (co klatkę)
+                            # Aktualizuj TYLKO wizualny BLUE BOX (szukamy nadal w ostatnim ArUco ROI)
                             half = self.blue_roi_half
                             bx = int(round(cx - half)); by = int(round(cy - half))
                             bw = int(2*half); bh = int(2*half)
-                            self.blue_roi = self._clip_bbox(bx, by, bw, bh, self.w, self.h)
-                            cv2.rectangle(frame_vis, (bx, by), (bx + bw, by + bh), (255, 0, 0), 2)
+                            self.blue_vis = self._clip_bbox(bx, by, bw, bh, self.w, self.h)
                             blue_updated = True
                         else:
                             cv2.putText(frame_vis, "LOST", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
@@ -428,7 +527,7 @@ class ArucoTracker:
                         cv2.putText(frame_vis, "LOST", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
             # Jeśli w tej klatce nie udało się zaktualizować BLUE ROI (brak DETECT/LK/CSRT),
-            # przesuń go ekstrapolacją z dwóch ostatnich zapisów (stała prędkość).
+            # przesuń box wizualny ekstrapolacją z dwóch ostatnich zapisów (stała prędkość).
             if not blue_updated:
                 if len(self.records) >= 2:
                     cx_prev, cy_prev = self.records[-2][1], self.records[-2][2]
@@ -438,10 +537,14 @@ class ArucoTracker:
                     half = self.blue_roi_half
                     bx = int(round(cx_pred - half)); by = int(round(cy_pred - half))
                     bw = int(2*half); bh = int(2*half)
-                    self.blue_roi = self._clip_bbox(bx, by, bw, bh, self.w, self.h)
-                    # dorysuj dla podglądu w MP4
-                    cv2.rectangle(frame_vis, (bx, by), (bx + bw, by + bh), (255, 0, 0), 2)
+                    self.blue_vis = self._clip_bbox(bx, by, bw, bh, self.w, self.h)
                     blue_updated = True
+
+            # Rysuj BLUE BOX: preferuj wizualny (może pochodzić z LK/CSRT/ekstrapolacji)
+            box_to_draw = self.blue_vis if self.blue_vis is not None else self.blue_roi
+            if box_to_draw is not None:
+                x, y, w, h = box_to_draw
+                cv2.rectangle(frame_vis, (x, y), (x + w, y + h), (255, 0, 0), 2)
 
             self.writer.write(frame_vis)
             # tryb offline: brak podglądu na żywo
