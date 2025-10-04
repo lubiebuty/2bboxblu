@@ -39,7 +39,8 @@ ARUCO_DICTS: Dict[str, int] = {
 
 
 class ArucoTracker:
-    def __init__(self,
+    def __init__(
+                 self,
                  video_path: str | int,
                  dict_name: str,
                  marker_id: int | None,
@@ -134,6 +135,13 @@ class ArucoTracker:
         self.lk_criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
         self.roi_expand = 1.6  # przy re-detect powiększamy ostatni bbox
 
+        # --- BLUE ROI (łańcuch) + bezpieczeństwo ---
+        self.blue_roi = None                    # (x,y,w,h)
+        self.blue_roi_half = 40                 # stałe ±40 px od środka (podstawowe okno)
+        self.blue_roi_half_big = 80             # „winda bezpieczeństwa” po 1 missie
+        self.blue_miss = 0                      # kolejne missy w BLUE ROI
+        self.anchor_every = 10                  # co N klatek próba full-frame kotwicy
+
     def _detect_in_roi(self, frame: np.ndarray, bbox: Tuple[int,int,int,int], id_wanted: int | None):
         """Wykryj ArUco w powiększonym ROI wokół ostatniego bboxa.
         Zwraca: (corners_4x2, id) lub (None, None).
@@ -163,6 +171,33 @@ class ArucoTracker:
         c[:, 1] += y1
         return c, int(ids[idx])
 
+    @staticmethod
+    def _clip_bbox(x: int, y: int, w: int, h: int, W: int, H: int) -> Tuple[int,int,int,int]:
+        x = max(0, x); y = max(0, y)
+        w = max(2, min(W - x, w)); h = max(2, min(H - y, h))
+        return (int(x), int(y), int(w), int(h))
+
+    def _detect_in_bbox(self, frame: np.ndarray, bbox: Tuple[int,int,int,int], id_wanted: int | None):
+        """Wykryj ArUco w *dokładnym* bboxie (bez dodatkowego skalowania)."""
+        x, y, w, h = bbox
+        roi = frame[y:y+h, x:x+w]
+        if roi.size == 0:
+            return None, None
+        corners, ids, _ = self._detect(roi)
+        if ids is None or not len(ids):
+            return None, None
+        ids = ids.flatten()
+        idx = 0
+        if id_wanted is not None:
+            matches = np.where(ids == id_wanted)[0]
+            if len(matches) == 0:
+                return None, None
+            idx = int(matches[0])
+        c = corners[idx][0].copy()
+        c[:,0] += x
+        c[:,1] += y
+        return c, int(ids[idx])
+
     def run(self) -> None:
         frame_idx = 0
         start = time.time()
@@ -179,28 +214,62 @@ class ArucoTracker:
             detected = False
             c = None  # aktualny czworokąt 4x2
             z_cm = None
+            used_blue = False
 
-            # 1) Detekcja pełnokadrowa
-            corners, ids, _ = self._detect(frame_vis)
-            if ids is not None and len(ids):
-                ids = ids.flatten()
-                idx = 0
-                if self.marker_id is not None:
-                    matches = np.where(ids == self.marker_id)[0]
-                    if len(matches):
-                        idx = int(matches[0])
+            # --- ŁAŃCUCHOWE WYSZUKIWANIE ---
+            if self.blue_roi is not None:
+                # 1) Szukaj w niebieskim b-boxie z poprzedniej klatki
+                c_roi, _ = self._detect_in_bbox(gray, self.blue_roi, self.marker_id)
+                if c_roi is not None:
+                    c = c_roi; detected = True; used_blue = True; self.blue_miss = 0
+                else:
+                    # 1a) Winda bezpieczeństwa: powiększ okno na tę jedną próbę
+                    cx_b = self.blue_roi[0] + self.blue_roi[2]/2.0
+                    cy_b = self.blue_roi[1] + self.blue_roi[3]/2.0
+                    half = self.blue_roi_half_big
+                    bx = int(round(cx_b - half)); by = int(round(cy_b - half))
+                    bw = int(2*half); bh = int(2*half)
+                    bx, by, bw, bh = self._clip_bbox(bx, by, bw, bh, self.w, self.h)
+                    big_box = (bx, by, bw, bh)
+                    c_big, _ = self._detect_in_bbox(gray, big_box, self.marker_id)
+                    if c_big is not None:
+                        c = c_big; detected = True; used_blue = True; self.blue_miss = 0
                     else:
-                        ids = None
-            if ids is not None and len(ids):
-                c = corners[idx][0]
-                detected = True
+                        self.blue_miss += 1
+                        # 1b) Po 2 missach – kotwica pełnokadrowa
+                        if self.blue_miss >= 2:
+                            corners, ids, _ = self._detect(gray)
+                            if ids is not None and len(ids):
+                                ids = ids.flatten(); idx = 0
+                                if self.marker_id is not None:
+                                    matches = np.where(ids == self.marker_id)[0]
+                                    if len(matches): idx = int(matches[0])
+                                    else: ids = None
+                                if ids is not None and len(ids):
+                                    c = corners[idx][0]; detected = True; used_blue = False; self.blue_miss = 0
             else:
-                # 2) Re-detect w ROI wokół ostatniego bboxa
-                if self.last_bbox is not None:
-                    c_roi, _ = self._detect_in_roi(frame_vis, self.last_bbox, self.marker_id)
-                    if c_roi is not None:
-                        c = c_roi
-                        detected = True
+                # 0) Pierwsza kotwica: pełny kadr
+                corners, ids, _ = self._detect(gray)
+                if ids is not None and len(ids):
+                    ids = ids.flatten(); idx = 0
+                    if self.marker_id is not None:
+                        matches = np.where(ids == self.marker_id)[0]
+                        if len(matches): idx = int(matches[0])
+                        else: ids = None
+                    if ids is not None and len(ids):
+                        c = corners[idx][0]; detected = True
+
+            # 0b) Dodatkowa kotwica co N klatek (gdy korzystaliśmy z BLUE ROI)
+            if detected and used_blue and self.anchor_every and (frame_idx % self.anchor_every == 0):
+                corners_a, ids_a, _ = self._detect(gray)
+                if ids_a is not None and len(ids_a):
+                    ids_a = ids_a.flatten(); idx_a = 0
+                    if self.marker_id is not None:
+                        matches = np.where(ids_a == self.marker_id)[0]
+                        if len(matches): idx_a = int(matches[0])
+                        else: ids_a = None
+                    if ids_a is not None and len(ids_a):
+                        c = corners_a[idx_a][0]
 
             if detected and c is not None:
                 self.lost_counter = 0
@@ -250,6 +319,16 @@ class ArucoTracker:
                 cv2.polylines(frame_vis, [c.astype(int)], True, (0, 255, 0), 2)
                 cv2.circle(frame_vis, (int(cx), int(cy)), 4, (0, 0, 255), -1)
                 self.records.append((t, cx, cy, z_cm))
+
+                # --- AKTUALIZUJ BLUE ROI (zawsze) ---
+                half = self.blue_roi_half
+                bx = int(round(cx - half)); by = int(round(cy - half))
+                bw = int(2*half); bh = int(2*half)
+                self.blue_roi = self._clip_bbox(bx, by, bw, bh, self.w, self.h)
+                # rysuj niebieski box
+                x, y, w, h = self.blue_roi
+                cv2.rectangle(frame_vis, (x, y), (x + w, y + h), (255, 0, 0), 2)
+
             else:
                 # Brak ArUco: 3) LK narożników, 4) CSRT
                 self.lost_counter += 1
@@ -261,12 +340,28 @@ class ArucoTracker:
                         winSize=self.lk_winSize, maxLevel=self.lk_maxLevel, criteria=self.lk_criteria
                     )
                     if next_pts is not None and st is not None:
-                        good = next_pts[st.flatten() == 1]
-                        if good is not None and len(good) >= 3:
+                        # Zachowujemy pełny porządek 4 narożników (tak jak w prev_pts)
+                        valid = st.flatten() == 1
+                        n_valid = int(valid.sum())
+                        if n_valid >= 3:
                             used_lk = True
-                            c_lk = good.reshape(-1, 2)
+                            curr_pts = self.prev_pts.copy()  # 4x1x2
+                            curr_pts[valid] = next_pts[valid]
+
+                            if n_valid == 3:
+                                # Odtwórz brakujący narożnik z transformacji afinicznej (3 korespondencje)
+                                src = self.prev_pts[valid].reshape(3,2).astype(np.float32)
+                                dst = next_pts[valid].reshape(3,2).astype(np.float32)
+                                M = cv2.getAffineTransform(src, dst)  # 2x3
+                                miss_idx = int(np.where(~valid)[0][0])
+                                p = self.prev_pts[miss_idx,0].astype(np.float32)  # (x,y) poprzedni
+                                pred = (M @ np.array([p[0], p[1], 1.0], dtype=np.float32)).reshape(2)
+                                curr_pts[miss_idx,0] = pred
+
+                            c_lk = curr_pts.reshape(-1, 2)
                             cx = float(np.mean(c_lk[:, 0]))
                             cy = float(np.mean(c_lk[:, 1]))
+
                             x_min, y_min = np.min(c_lk, axis=0)
                             x_max, y_max = np.max(c_lk, axis=0)
                             pad = 15
@@ -279,16 +374,17 @@ class ArucoTracker:
                             )
                             self.last_bbox = bbox
 
-                            # update stanu LK
+                            # update stanu LK (pełny zestaw 4 punktów)
                             self.prev_gray = gray.copy()
-                            self.prev_pts = next_pts
+                            self.prev_pts = curr_pts
 
-                            # rysowanie
+                            # rysowanie zawsze 4 punktów
                             cv2.polylines(frame_vis, [c_lk.astype(int)], True, (0, 255, 255), 2)
                             cv2.circle(frame_vis, (int(cx), int(cy)), 4, (0, 255, 255), -1)
                             self.records.append((t, cx, cy, None))
+                            state = "LK"
                         else:
-                            # LK się posypał – wyłączamy, przechodzimy do CSRT
+                            # Za mało punktów → wyłącz LK i przejdź do CSRT
                             self.lk_active = False
                             self.prev_gray = None
                             self.prev_pts = None
@@ -314,6 +410,11 @@ class ArucoTracker:
                             cv2.putText(frame_vis, "LOST", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                     else:
                         cv2.putText(frame_vis, "LOST", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+            # Rysuj BLUE ROI dla podglądu
+            if self.blue_roi is not None:
+                x, y, w, h = self.blue_roi
+                cv2.rectangle(frame_vis, (x, y), (x + w, y + h), (255, 0, 0), 2)
 
             self.writer.write(frame_vis)
             cv2.imshow("tracker", frame_vis)
