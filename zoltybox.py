@@ -215,6 +215,7 @@ class ArucoTracker:
             c = None  # aktualny czworokąt 4x2
             z_cm = None
             used_blue = False
+            blue_updated = False
 
             # --- ŁAŃCUCHOWE WYSZUKIWANIE ---
             if self.blue_roi is not None:
@@ -328,6 +329,7 @@ class ArucoTracker:
                 # rysuj niebieski box
                 x, y, w, h = self.blue_roi
                 cv2.rectangle(frame_vis, (x, y), (x + w, y + h), (255, 0, 0), 2)
+                blue_updated = True
 
             else:
                 # Brak ArUco: 3) LK narożników, 4) CSRT
@@ -382,6 +384,13 @@ class ArucoTracker:
                             cv2.polylines(frame_vis, [c_lk.astype(int)], True, (0, 255, 255), 2)
                             cv2.circle(frame_vis, (int(cx), int(cy)), 4, (0, 255, 255), -1)
                             self.records.append((t, cx, cy, None))
+                            # Aktualizuj BLUE ROI na podstawie LK (co klatkę)
+                            half = self.blue_roi_half
+                            bx = int(round(cx - half)); by = int(round(cy - half))
+                            bw = int(2*half); bh = int(2*half)
+                            self.blue_roi = self._clip_bbox(bx, by, bw, bh, self.w, self.h)
+                            cv2.rectangle(frame_vis, (bx, by), (bx + bw, by + bh), (255, 0, 0), 2)
+                            blue_updated = True
                             state = "LK"
                         else:
                             # Za mało punktów → wyłącz LK i przejdź do CSRT
@@ -406,52 +415,73 @@ class ArucoTracker:
                             cv2.rectangle(frame_vis, (x, y), (x + w, y + h), (255, 0, 0), 2)
                             cv2.circle(frame_vis, (int(cx), int(cy)), 4, (255, 0, 0), -1)
                             self.records.append((t, cx, cy, None))
+                            # Aktualizuj BLUE ROI z CSRT (co klatkę)
+                            half = self.blue_roi_half
+                            bx = int(round(cx - half)); by = int(round(cy - half))
+                            bw = int(2*half); bh = int(2*half)
+                            self.blue_roi = self._clip_bbox(bx, by, bw, bh, self.w, self.h)
+                            cv2.rectangle(frame_vis, (bx, by), (bx + bw, by + bh), (255, 0, 0), 2)
+                            blue_updated = True
                         else:
                             cv2.putText(frame_vis, "LOST", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                     else:
                         cv2.putText(frame_vis, "LOST", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
-            # Rysuj BLUE ROI dla podglądu
-            if self.blue_roi is not None:
-                x, y, w, h = self.blue_roi
-                cv2.rectangle(frame_vis, (x, y), (x + w, y + h), (255, 0, 0), 2)
+            # Jeśli w tej klatce nie udało się zaktualizować BLUE ROI (brak DETECT/LK/CSRT),
+            # przesuń go ekstrapolacją z dwóch ostatnich zapisów (stała prędkość).
+            if not blue_updated:
+                if len(self.records) >= 2:
+                    cx_prev, cy_prev = self.records[-2][1], self.records[-2][2]
+                    cx_last, cy_last = self.records[-1][1], self.records[-1][2]
+                    cx_pred = 2*cx_last - cx_prev
+                    cy_pred = 2*cy_last - cy_prev
+                    half = self.blue_roi_half
+                    bx = int(round(cx_pred - half)); by = int(round(cy_pred - half))
+                    bw = int(2*half); bh = int(2*half)
+                    self.blue_roi = self._clip_bbox(bx, by, bw, bh, self.w, self.h)
+                    # dorysuj dla podglądu w MP4
+                    cv2.rectangle(frame_vis, (bx, by), (bx + bw, by + bh), (255, 0, 0), 2)
+                    blue_updated = True
 
             self.writer.write(frame_vis)
-            cv2.imshow("tracker", frame_vis)
-            if cv2.waitKey(1) & 0xFF == 27:
-                break
+            # tryb offline: brak podglądu na żywo
             frame_idx += 1
 
         self.cap.release(); self.writer.release(); cv2.destroyAllWindows()
+        # zapisz wyniki i wykresy
         self._postprocess()
 
     def _postprocess(self) -> None:
         if not self.records:
+            print("⚠ Brak zapisanych rekordów – pomijam CSV/wykresy.")
             return
+        # przygotuj ramkę danych
         df = pd.DataFrame(self.records, columns=["t","cx","cy","z_cm"])
-        # Δy: dodatnie w górę, ujemne w dół
-        df["dy_px"] = self.first_center[1] - df["cy"] if self.first_center is not None else 0.0
+        if self.first_center is not None:
+            df["dy_px"] = self.first_center[1] - df["cy"]
+        else:
+            df["dy_px"] = 0.0
+        # zapisz CSV
         df.to_csv("positions_px.csv", index=False)
-
+        # wykres wychylenia pionowego
         plt.figure(figsize=(8,4))
         plt.plot(df["t"], df["dy_px"])
         plt.axhline(0, linewidth=0.8)
         plt.xlabel("Czas [s]"); plt.ylabel("Δy [px]")
         plt.title("Wychylenie pionowe markera")
-        plt.grid(); plt.tight_layout()
+        plt.grid(True); plt.tight_layout()
         plt.savefig("deflection_px.png", dpi=150)
-        plt.show()
-
+        plt.close()
+        # wykres Z, jeśli dostępny
         if df["z_cm"].notna().any():
             plt.figure(figsize=(8,4))
-            plt.plot(df["t"], df["z_cm"], label="Z [cm]")
+            plt.plot(df["t"], df["z_cm"])
             plt.xlabel("Czas [s]"); plt.ylabel("Z [cm]")
             plt.title("Przemieszczenie osi Z")
-            plt.grid(); plt.tight_layout()
+            plt.grid(True); plt.tight_layout()
             plt.savefig("deflection_z_cm.png", dpi=150)
-            plt.show()
-
-        print("✔ zapisano positions_px.csv i deflection_px.png")
+            plt.close()
+        print("✔ Zapisano: positions_px.csv, deflection_px.png" + (" i deflection_z_cm.png" if df["z_cm"].notna().any() else ""))
 
 
 if __name__ == "__main__":
