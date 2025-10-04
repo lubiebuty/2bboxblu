@@ -22,7 +22,7 @@ import sys, time
 from typing import List, Tuple, Dict
 
 # ------------ Ustawienia -------------
-VIDEO_PATH = "/Users/bartlomiejostasz/lot/n/git/1.mov"
+VIDEO_PATH = "/Users/bartlomiejostasz/PYCH/nagrania/test.MOV"
 # plik kalibracyjny kamery (macierz K i dystorsja)
 CALIB_PATH = '/Users/bartlomiejostasz/PYCH/LOT/1:5.npz'
 ARUCO_DICT = "DICT_6X6_1000"   # ręcznie lub AUTO w przyszłości
