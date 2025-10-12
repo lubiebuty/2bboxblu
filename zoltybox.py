@@ -18,17 +18,18 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 from pathlib import Path
-import sys, time
-from typing import List, Tuple, Dict
+import sys, time, os
+from typing import List, Tuple, Dict, Any
 
 # ------------ Ustawienia -------------
-VIDEO_PATH = "/Users/bartlomiejostasz/lot/n/git/1.mov"
+VIDEO_PATH = "/Users/bartlomiejostasz/PYCH/nagrania/12 pazdziernik niedziela rano /tescik.MOV"
 # plik kalibracyjny kamery (macierz K i dystorsja)
-CALIB_PATH = '/Users/bartlomiejostasz/PYCH/LOT/1:5.npz'
+CALIB_PATH = '/Users/bartlomiejostasz/PYCH/nagrania/dane do kalibracji /charuco_calibration_with_distance.npz'
 ARUCO_DICT = "DICT_6X6_1000"   # ręcznie lub AUTO w przyszłości
 MARKER_ID  = 2                 # None = pierwszy wykryty
 OUT_VIDEO  = "out_annotated.mp4"
-MARKER_LEN_M = 0.04            # wymiar boku markera w metrach (tu: 4 cm)
+# MARKER_LEN_M = 0.034           # wymiar boku markera w metrach (tu: 3.4 cm)
+MARKER_LEN_M = 0.034           # wymiar boku markera w metrach (tu: 3.4 cm)
 # -------------------------------------
 
 # słowniki OpenCV
@@ -108,7 +109,7 @@ class ArucoTracker:
         self.lost_counter = 0
         self.lost_thresh  = 1
 
-        self.records: List[Tuple[float,float,float,float | None]] = []
+        self.records: List[Dict[str, Any]] = []
         self.first_center: Tuple[float,float] | None = None
 
         self.K = camera_matrix
@@ -125,6 +126,12 @@ class ArucoTracker:
             # zerowa dystorsja dla newK
             self.zeroD = np.zeros((1,5), dtype=np.float32)
             self.use_undistort = True
+
+        # --- PnP / ray–plane pomocnicze stany ---
+        self.last_rvec = None   # 3x1, ostatnia dobra poza (ArUco)
+        self.last_tvec = None   # 3x1
+        self.last_z_m = None    # ostatnie Z w metrach
+        self.first_marker_xy_cm = None  # (X0_cm, Y0_cm) – odniesienie w ukł. markera
 
         # --- Lucas–Kanade (LK) fallback i ROI re-detect ---
         self.lk_active = False
@@ -303,6 +310,34 @@ class ArucoTracker:
         c[:,1] += y
         return c, int(ids[idx])
 
+    def _pixel_to_marker_cm(self, u: float, v: float, rvec: np.ndarray, tvec: np.ndarray) -> Tuple[float, float]:
+        """Rzutuj piksel (u,v) na płaszczyznę markera i zwróć (X_cm, Y_cm) w układzie markera.
+        Zakładamy, że obraz jest po undistort i używamy macierzy self.newK, a dystorsja = 0.
+        Jeśli nie mamy newK (brak kalibracji), używamy self.K jako przybliżenia.
+        """
+        K = self.newK if hasattr(self, 'newK') and self.newK is not None else self.K
+        if K is None:
+            # Bez kalibracji nie zrobimy poprawnego ray–plane → wróć 0,0 (wyżej zabezpieczamy wywołanie)
+            return 0.0, 0.0
+        if rvec is None or tvec is None:
+            return 0.0, 0.0
+        R, _ = cv2.Rodrigues(rvec.reshape(3,1))
+        t = tvec.reshape(3,1)
+        n = R @ np.array([[0.0],[0.0],[1.0]], dtype=np.float64)  # normalna płaszczyzny markera w ukł. kamery
+        dinv = np.linalg.inv(K) @ np.array([[float(u)],[float(v)],[1.0]], dtype=np.float64)  # kierunek promienia
+        denom_arr = (n.T @ dinv)
+        denom = float(denom_arr.item())
+        if abs(denom) < 1e-9:
+            # promień równoległy do płaszczyzny – numerycznie niepewne
+            return 0.0, 0.0
+        num = float((n.T @ t).item())
+        lam = num / denom
+        X_cam = lam * dinv                      # 3x1 punkt przecięcia w kamerze
+        X_mark = R.T @ (X_cam - t)              # do układu markera
+        X_cm = float(X_mark[0, 0] * 100.0)
+        Y_cm = float(X_mark[1, 0] * 100.0)
+        return X_cm, Y_cm
+
     def run(self) -> None:
         frame_idx = 0
         start = time.time()
@@ -366,12 +401,23 @@ class ArucoTracker:
 
                 # Środek markera: z geometrii jeśli mamy kalibrację, inaczej centroid narożników
                 if self.use_undistort:
-                    rvec, tvec, _ = cv2.aruco.estimatePoseSingleMarkers([c], MARKER_LEN_M, self.newK, self.zeroD)
-                    center_img, _ = cv2.projectPoints(np.array([[0., 0., 0.]], np.float32), rvec[0], tvec[0], self.newK, self.zeroD)
+                    # OpenCV oczekuje kształtu (N,1,4,2); robimy 1 marker
+                    corners_ = c.reshape(1, 1, 4, 2).astype(np.float32)
+                    rvec, tvec, _ = cv2.aruco.estimatePoseSingleMarkers(corners_, MARKER_LEN_M, self.newK, self.zeroD)
+                    rvec0 = rvec[0].reshape(3,1)
+                    tvec0 = tvec[0].reshape(3,1)
+                    center_img, _ = cv2.projectPoints(np.array([[0., 0., 0.]], np.float32), rvec0, tvec0, self.newK, self.zeroD)
                     cx, cy = map(float, center_img.ravel())
-                    z_cm = float(tvec[0][0][2] * 100.0)
+                    z_cm = float(tvec0[2,0] * 100.0)
+                    # zapamiętaj ostatnią dobrą pozę do forward-fill
+                    self.last_rvec, self.last_tvec = rvec0.copy(), tvec0.copy()
+                    self.last_z_m = float(tvec0[2,0])
+                    # przelicz (X_cm, Y_cm) z ray–plane
+                    x_cm, y_cm = self._pixel_to_marker_cm(cx, cy, rvec0, tvec0)
                 else:
                     cx, cy = c.mean(axis=0)
+                    z_cm = None
+                    x_cm = None; y_cm = None
 
                 # bbox z paddingiem
                 pad = 15
@@ -406,9 +452,29 @@ class ArucoTracker:
 
                 if self.first_center is None:
                     self.first_center = (cx, cy)
+                # ustal punkt odniesienia w układzie markera (pierwsza dobra poza)
+                if self.first_marker_xy_cm is None and x_cm is not None and y_cm is not None:
+                    self.first_marker_xy_cm = (x_cm, y_cm)
+                # rysowanie
                 cv2.polylines(frame_vis, [c.astype(int)], True, (0, 255, 0), 2)
                 cv2.circle(frame_vis, (int(cx), int(cy)), 4, (0, 0, 255), -1)
-                self.records.append((t, cx, cy, z_cm))
+                # przemieszczenia w px (zgodnie z dotychczasową konwencją dla Y)
+                dx_px = cx - self.first_center[0]
+                dy_px = self.first_center[1] - cy
+                # przemieszczenia w cm jeśli możliwe
+                if self.first_marker_xy_cm is not None and x_cm is not None and y_cm is not None:
+                    dx_cm = x_cm - self.first_marker_xy_cm[0]
+                    dy_cm = y_cm - self.first_marker_xy_cm[1]
+                else:
+                    dx_cm = None; dy_cm = None
+                # zapis rekordu jako słownik (łatwiejsze rozszerzanie)
+                self.records.append({
+                    "t": t, "cx": cx, "cy": cy, "z_cm": z_cm,
+                    "x_cm": x_cm, "y_cm": y_cm,
+                    "dx_px": dx_px, "dy_px": dy_px,
+                    "dx_cm": dx_cm, "dy_cm": dy_cm,
+                    "source": "aruco"
+                })
 
                 # --- AKTUALIZUJ BLUE ROI (po ArUco) ---
                 half = self.blue_roi_half
@@ -470,7 +536,27 @@ class ArucoTracker:
                                 # rysowanie tylko gdy wiarygodne
                                 cv2.polylines(frame_vis, [c_lk.astype(int)], True, (0, 255, 255), 2)
                                 cv2.circle(frame_vis, (int(cx), int(cy)), 4, (0, 255, 255), -1)
-                                self.records.append((t, cx, cy, None))
+                                # przeliczenia w cm z ostatniej dobrej pozy (forward-fill)
+                                if self.last_rvec is not None and self.last_tvec is not None and self.use_undistort:
+                                    x_cm, y_cm = self._pixel_to_marker_cm(cx, cy, self.last_rvec, self.last_tvec)
+                                else:
+                                    x_cm = None; y_cm = None
+                                if self.first_center is None:
+                                    self.first_center = (cx, cy)
+                                dx_px = cx - self.first_center[0]
+                                dy_px = self.first_center[1] - cy
+                                if self.first_marker_xy_cm is not None and x_cm is not None and y_cm is not None:
+                                    dx_cm = x_cm - self.first_marker_xy_cm[0]
+                                    dy_cm = y_cm - self.first_marker_xy_cm[1]
+                                else:
+                                    dx_cm = None; dy_cm = None
+                                self.records.append({
+                                    "t": t, "cx": cx, "cy": cy, "z_cm": None,
+                                    "x_cm": x_cm, "y_cm": y_cm,
+                                    "dx_px": dx_px, "dy_px": dy_px,
+                                    "dx_cm": dx_cm, "dy_cm": dy_cm,
+                                    "source": "lk"
+                                })
 
                                 # wizualny BLUE BOX
                                 half = self.blue_roi_half
@@ -514,7 +600,26 @@ class ArucoTracker:
                             w, h = nw, nh
                             cv2.rectangle(frame_vis, (x, y), (x + w, y + h), (255, 0, 0), 2)
                             cv2.circle(frame_vis, (int(cx), int(cy)), 4, (255, 0, 0), -1)
-                            self.records.append((t, cx, cy, None))
+                            if self.last_rvec is not None and self.last_tvec is not None and self.use_undistort:
+                                x_cm, y_cm = self._pixel_to_marker_cm(cx, cy, self.last_rvec, self.last_tvec)
+                            else:
+                                x_cm = None; y_cm = None
+                            if self.first_center is None:
+                                self.first_center = (cx, cy)
+                            dx_px = cx - self.first_center[0]
+                            dy_px = self.first_center[1] - cy
+                            if self.first_marker_xy_cm is not None and x_cm is not None and y_cm is not None:
+                                dx_cm = x_cm - self.first_marker_xy_cm[0]
+                                dy_cm = y_cm - self.first_marker_xy_cm[1]
+                            else:
+                                dx_cm = None; dy_cm = None
+                            self.records.append({
+                                "t": t, "cx": cx, "cy": cy, "z_cm": None,
+                                "x_cm": x_cm, "y_cm": y_cm,
+                                "dx_px": dx_px, "dy_px": dy_px,
+                                "dx_cm": dx_cm, "dy_cm": dy_cm,
+                                "source": "csrt"
+                            })
                             # Aktualizuj TYLKO wizualny BLUE BOX (szukamy nadal w ostatnim ArUco ROI)
                             half = self.blue_roi_half
                             bx = int(round(cx - half)); by = int(round(cy - half))
@@ -530,8 +635,8 @@ class ArucoTracker:
             # przesuń box wizualny ekstrapolacją z dwóch ostatnich zapisów (stała prędkość).
             if not blue_updated:
                 if len(self.records) >= 2:
-                    cx_prev, cy_prev = self.records[-2][1], self.records[-2][2]
-                    cx_last, cy_last = self.records[-1][1], self.records[-1][2]
+                    cx_prev, cy_prev = self.records[-2]["cx"], self.records[-2]["cy"]
+                    cx_last, cy_last = self.records[-1]["cx"], self.records[-1]["cy"]
                     cx_pred = 2*cx_last - cx_prev
                     cy_pred = 2*cy_last - cy_prev
                     half = self.blue_roi_half
@@ -558,25 +663,71 @@ class ArucoTracker:
         if not self.records:
             print("⚠ Brak zapisanych rekordów – pomijam CSV/wykresy.")
             return
-        # przygotuj ramkę danych
-        df = pd.DataFrame(self.records, columns=["t","cx","cy","z_cm"])
-        if self.first_center is not None:
-            df["dy_px"] = self.first_center[1] - df["cy"]
-        else:
-            df["dy_px"] = 0.0
-        # zapisz CSV
-        df.to_csv("positions_px.csv", index=False)
-        # wykres wychylenia pionowego
+        # records to DataFrame (słowniki → kolumny)
+        df = pd.DataFrame(self.records)
+        # Uzupełnij dy_px jeśli nie było ustawione (wsteczna zgodność)
+        if "dy_px" not in df.columns:
+            if self.first_center is not None:
+                df["dy_px"] = self.first_center[1] - df["cy"]
+            else:
+                df["dy_px"] = 0.0
+        if "dx_px" not in df.columns:
+            if self.first_center is not None:
+                df["dx_px"] = df["cx"] - self.first_center[0]
+            else:
+                df["dx_px"] = 0.0
+        # Zapisy: CSV
+        cols_order = [c for c in [
+            "t","cx","cy","z_cm","x_cm","y_cm","dx_px","dy_px","dx_cm","dy_cm","source"
+        ] if c in df.columns]
+        df.to_csv("positions_px.csv", index=False, columns=cols_order)
+        # Wykresy px
+        if "dx_px" in df.columns:
+            plt.figure(figsize=(8,4))
+            plt.plot(df["t"], df["dx_px"])
+            plt.axhline(0, linewidth=0.8)
+            plt.xlabel("Czas [s]"); plt.ylabel("Δx [px]")
+            plt.title("Wychylenie poziome markera")
+            plt.grid(True); plt.tight_layout()
+            plt.savefig("deflection_x_px.png", dpi=150)
+            plt.close()
         plt.figure(figsize=(8,4))
         plt.plot(df["t"], df["dy_px"])
         plt.axhline(0, linewidth=0.8)
         plt.xlabel("Czas [s]"); plt.ylabel("Δy [px]")
         plt.title("Wychylenie pionowe markera")
         plt.grid(True); plt.tight_layout()
-        plt.savefig("deflection_px.png", dpi=150)
+        plt.savefig("deflection_y_px.png", dpi=150)
         plt.close()
+        # zachowaj starą nazwę pliku dla zgodności – kopia Y
+        try:
+            import shutil
+            shutil.copyfile("deflection_y_px.png", "deflection_px.png")
+        except Exception:
+            pass
+        # Wykresy cm (tylko jeśli mamy obie kolumny)
+        has_cm = ("dx_cm" in df.columns and df["dx_cm"].notna().any()) or ("dy_cm" in df.columns and df["dy_cm"].notna().any())
+        if has_cm:
+            if "dx_cm" in df.columns and df["dx_cm"].notna().any():
+                plt.figure(figsize=(8,4))
+                plt.plot(df["t"], df["dx_cm"])
+                plt.axhline(0, linewidth=0.8)
+                plt.xlabel("Czas [s]"); plt.ylabel("Δx [cm]")
+                plt.title("Wychylenie poziome [cm]")
+                plt.grid(True); plt.tight_layout()
+                plt.savefig("deflection_x_cm.png", dpi=150)
+                plt.close()
+            if "dy_cm" in df.columns and df["dy_cm"].notna().any():
+                plt.figure(figsize=(8,4))
+                plt.plot(df["t"], df["dy_cm"])
+                plt.axhline(0, linewidth=0.8)
+                plt.xlabel("Czas [s]"); plt.ylabel("Δy [cm]")
+                plt.title("Wychylenie pionowe [cm]")
+                plt.grid(True); plt.tight_layout()
+                plt.savefig("deflection_y_cm.png", dpi=150)
+                plt.close()
         # wykres Z, jeśli dostępny
-        if df["z_cm"].notna().any():
+        if "z_cm" in df.columns and df["z_cm"].notna().any():
             plt.figure(figsize=(8,4))
             plt.plot(df["t"], df["z_cm"])
             plt.xlabel("Czas [s]"); plt.ylabel("Z [cm]")
@@ -584,7 +735,13 @@ class ArucoTracker:
             plt.grid(True); plt.tight_layout()
             plt.savefig("deflection_z_cm.png", dpi=150)
             plt.close()
-        print("✔ Zapisano: positions_px.csv, deflection_px.png" + (" i deflection_z_cm.png" if df["z_cm"].notna().any() else ""))
+        # Podsumowanie
+        saved = ["positions_px.csv","deflection_y_px.png"]
+        if os.path.exists("deflection_x_px.png"): saved.append("deflection_x_px.png")
+        if os.path.exists("deflection_x_cm.png"): saved.append("deflection_x_cm.png")
+        if os.path.exists("deflection_y_cm.png"): saved.append("deflection_y_cm.png")
+        if os.path.exists("deflection_z_cm.png"): saved.append("deflection_z_cm.png")
+        print("✔ Zapisano: " + ", ".join(saved))
 
 
 if __name__ == "__main__":
