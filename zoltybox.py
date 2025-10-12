@@ -18,16 +18,22 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 from pathlib import Path
-import sys, time, os
+import sys, time, os, re
 from typing import List, Tuple, Dict, Any
 
+from datetime import datetime
+import shutil
+
 # ------------ Ustawienia -------------
-VIDEO_PATH = "/Users/bartlomiejostasz/PYCH/nagrania/12 pazdziernik niedziela rano /tescik.MOV"
+# ------------ Ustawienia -------------
+VIDEO_PATH = "/Users/bartlomiejostasz/PYCH/nagrania/12 pazdziernik niedziela rano /test long.MOV"
 # plik kalibracyjny kamery (macierz K i dystorsja)
 CALIB_PATH = '/Users/bartlomiejostasz/PYCH/nagrania/dane do kalibracji /charuco_calibration_with_distance.npz'
 ARUCO_DICT = "DICT_6X6_1000"   # ręcznie lub AUTO w przyszłości
 MARKER_ID  = 2                 # None = pierwszy wykryty
 OUT_VIDEO  = "out_annotated.mp4"
+# numer serii; jeśli None, wybierze się automatycznie kolejny
+SERIES_NO = None  # numer serii; jeśli None, wybierze się automatycznie kolejny
 # MARKER_LEN_M = 0.034           # wymiar boku markera w metrach (tu: 3.4 cm)
 MARKER_LEN_M = 0.034           # wymiar boku markera w metrach (tu: 3.4 cm)
 # -------------------------------------
@@ -38,6 +44,40 @@ ARUCO_DICTS: Dict[str, int] = {
     for name in dir(cv2.aruco) if name.startswith("DICT_")
 }
 
+# --- Helpers: numer serii i folder wyjściowy ---
+
+def _next_series_number(base: Path) -> int:
+    """Zwraca kolejny numer serii na podstawie istniejących folderów 'seria N - ...' w katalogu programu."""
+    max_no = 0
+    for p in base.iterdir():
+        if p.is_dir():
+            m = re.match(r"(?i)^seria[ _-]?(\d+)", p.name)
+            if m:
+                try:
+                    n = int(m.group(1))
+                    if n > max_no:
+                        max_no = n
+                except Exception:
+                    pass
+    return max_no + 1
+
+
+def _make_output_dir(series_no: int | None) -> tuple[Path, int]:
+    """Tworzy folder 'seria {N} - YYYY-MM-DD_HH-MM-SS' w folderze programu i zwraca (sciezka, N)."""
+    base = Path(__file__).resolve().parent
+    if series_no is None:
+        series_no = _next_series_number(base)
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    folder_name = f"seria {series_no} - {ts}"
+    out_dir = base / folder_name
+    # unikaj kolizji nazw (mało prawdopodobne, ale na wszelki wypadek)
+    idx = 2
+    while out_dir.exists():
+        out_dir = base / f"{folder_name}_{idx}"
+        idx += 1
+    out_dir.mkdir(parents=True, exist_ok=False)
+    return out_dir, series_no
+
 
 class ArucoTracker:
     def __init__(
@@ -47,7 +87,8 @@ class ArucoTracker:
                  marker_id: int | None,
                  out_path: str,
                  camera_matrix=None,
-                 dist_coeffs=None) -> None:
+                 dist_coeffs=None,
+                 out_dir: str | Path = ".") -> None:
         if dict_name not in ARUCO_DICTS:
             raise ValueError("Nieznany słownik ArUco")
         self.cap = cv2.VideoCapture(video_path)
@@ -115,6 +156,9 @@ class ArucoTracker:
         self.K = camera_matrix
         self.D = dist_coeffs
 
+        # katalog wyjściowy
+        self.out_dir = Path(out_dir)
+
         # --- Precompute undistort maps ---
         self.use_undistort = False
         if self.K is not None and self.D is not None:
@@ -132,6 +176,16 @@ class ArucoTracker:
         self.last_tvec = None   # 3x1
         self.last_z_m = None    # ostatnie Z w metrach
         self.first_marker_xy_cm = None  # (X0_cm, Y0_cm) – odniesienie w ukł. markera
+
+        # --- Stały układ odniesienia płaszczyzny (z pierwszej dobrej pozy) ---
+        self.ref_R = None  # 3x3 macierz R z pierwszej dobrej klatki
+        self.ref_t = None  # 3x1 wektor t z pierwszej dobrej klatki
+        # Precompute fx, fy dla prostego przelicznika px→cm (fallback)
+        if self.use_undistort:
+            self.fx = float(self.newK[0, 0]); self.fy = float(self.newK[1, 1])
+        else:
+            self.fx = float(self.K[0, 0]) if self.K is not None else None
+            self.fy = float(self.K[1, 1]) if self.K is not None else None
 
         # --- Lucas–Kanade (LK) fallback i ROI re-detect ---
         self.lk_active = False
@@ -338,6 +392,22 @@ class ArucoTracker:
         Y_cm = float(X_mark[1, 0] * 100.0)
         return X_cm, Y_cm
 
+    def _cm_from_pose(self, rvec: np.ndarray, tvec: np.ndarray) -> Tuple[float, float] | Tuple[None, None]:
+        """Policz (dx_cm, dy_cm) jako rzut różnicy położeń środka markera na osie płaszczyzny
+        z pierwszej dobrej klatki: e1=R0[:,0], e2=R0[:,1]. Jednostki: cm.
+        Zwraca (None, None) jeśli brak referencji.
+        """
+        if rvec is None or tvec is None or self.ref_R is None or self.ref_t is None:
+            return None, None
+        R, _ = cv2.Rodrigues(rvec.reshape(3,1))
+        t = tvec.reshape(3,1)
+        d = t - self.ref_t  # 3x1 w kamerze
+        e1 = self.ref_R[:, [0]]  # 3x1
+        e2 = self.ref_R[:, [1]]  # 3x1
+        dx = float((d.T @ e1).item()) * 100.0
+        dy = float((d.T @ e2).item()) * 100.0
+        return dx, dy
+
     def run(self) -> None:
         frame_idx = 0
         start = time.time()
@@ -412,11 +482,17 @@ class ArucoTracker:
                     # zapamiętaj ostatnią dobrą pozę do forward-fill
                     self.last_rvec, self.last_tvec = rvec0.copy(), tvec0.copy()
                     self.last_z_m = float(tvec0[2,0])
-                    # przelicz (X_cm, Y_cm) z ray–plane
-                    x_cm, y_cm = self._pixel_to_marker_cm(cx, cy, rvec0, tvec0)
+                    # ustaw referencję płaszczyzny przy pierwszej dobrej pozie
+                    if self.ref_R is None or self.ref_t is None:
+                        self.ref_R, _ = cv2.Rodrigues(rvec0)
+                        self.ref_t = tvec0.copy()
+                    # przemieszczenia w cm względem referencji (oś płaszczyzny z pierwszej klatki)
+                    dx_pose_cm, dy_pose_cm = self._cm_from_pose(rvec0, tvec0)
+                    x_cm = None; y_cm = None
                 else:
                     cx, cy = c.mean(axis=0)
                     z_cm = None
+                    dx_pose_cm = None; dy_pose_cm = None
                     x_cm = None; y_cm = None
 
                 # bbox z paddingiem
@@ -452,21 +528,18 @@ class ArucoTracker:
 
                 if self.first_center is None:
                     self.first_center = (cx, cy)
-                # ustal punkt odniesienia w układzie markera (pierwsza dobra poza)
-                if self.first_marker_xy_cm is None and x_cm is not None and y_cm is not None:
-                    self.first_marker_xy_cm = (x_cm, y_cm)
                 # rysowanie
                 cv2.polylines(frame_vis, [c.astype(int)], True, (0, 255, 0), 2)
                 cv2.circle(frame_vis, (int(cx), int(cy)), 4, (0, 0, 255), -1)
                 # przemieszczenia w px (zgodnie z dotychczasową konwencją dla Y)
                 dx_px = cx - self.first_center[0]
                 dy_px = self.first_center[1] - cy
-                # przemieszczenia w cm jeśli możliwe
-                if self.first_marker_xy_cm is not None and x_cm is not None and y_cm is not None:
-                    dx_cm = x_cm - self.first_marker_xy_cm[0]
-                    dy_cm = y_cm - self.first_marker_xy_cm[1]
+                # przemieszczenie pionowe w cm liczone z geometrii obrazu (fy, Z)
+                if self.last_z_m is not None and self.fy is not None:
+                    dy_cm = (dy_px / self.fy) * self.last_z_m * 100.0
                 else:
-                    dx_cm = None; dy_cm = None
+                    dy_cm = None
+                dx_cm = None  # nie wykorzystujemy poziomego cm w tym wariancie
                 # zapis rekordu jako słownik (łatwiejsze rozszerzanie)
                 self.records.append({
                     "t": t, "cx": cx, "cy": cy, "z_cm": z_cm,
@@ -536,20 +609,17 @@ class ArucoTracker:
                                 # rysowanie tylko gdy wiarygodne
                                 cv2.polylines(frame_vis, [c_lk.astype(int)], True, (0, 255, 255), 2)
                                 cv2.circle(frame_vis, (int(cx), int(cy)), 4, (0, 255, 255), -1)
-                                # przeliczenia w cm z ostatniej dobrej pozy (forward-fill)
-                                if self.last_rvec is not None and self.last_tvec is not None and self.use_undistort:
-                                    x_cm, y_cm = self._pixel_to_marker_cm(cx, cy, self.last_rvec, self.last_tvec)
-                                else:
-                                    x_cm = None; y_cm = None
+                                # przeliczenia w cm – fallback: lokalna skala z ostatniego Z i fx/fy
                                 if self.first_center is None:
                                     self.first_center = (cx, cy)
                                 dx_px = cx - self.first_center[0]
                                 dy_px = self.first_center[1] - cy
-                                if self.first_marker_xy_cm is not None and x_cm is not None and y_cm is not None:
-                                    dx_cm = x_cm - self.first_marker_xy_cm[0]
-                                    dy_cm = y_cm - self.first_marker_xy_cm[1]
+                                if self.last_z_m is not None and self.fy is not None:
+                                    dy_cm = (dy_px / self.fy) * self.last_z_m * 100.0
                                 else:
-                                    dx_cm = None; dy_cm = None
+                                    dy_cm = None
+                                dx_cm = None
+                                x_cm = None; y_cm = None
                                 self.records.append({
                                     "t": t, "cx": cx, "cy": cy, "z_cm": None,
                                     "x_cm": x_cm, "y_cm": y_cm,
@@ -600,19 +670,16 @@ class ArucoTracker:
                             w, h = nw, nh
                             cv2.rectangle(frame_vis, (x, y), (x + w, y + h), (255, 0, 0), 2)
                             cv2.circle(frame_vis, (int(cx), int(cy)), 4, (255, 0, 0), -1)
-                            if self.last_rvec is not None and self.last_tvec is not None and self.use_undistort:
-                                x_cm, y_cm = self._pixel_to_marker_cm(cx, cy, self.last_rvec, self.last_tvec)
-                            else:
-                                x_cm = None; y_cm = None
                             if self.first_center is None:
                                 self.first_center = (cx, cy)
                             dx_px = cx - self.first_center[0]
                             dy_px = self.first_center[1] - cy
-                            if self.first_marker_xy_cm is not None and x_cm is not None and y_cm is not None:
-                                dx_cm = x_cm - self.first_marker_xy_cm[0]
-                                dy_cm = y_cm - self.first_marker_xy_cm[1]
+                            if self.last_z_m is not None and self.fy is not None:
+                                dy_cm = (dy_px / self.fy) * self.last_z_m * 100.0
                             else:
-                                dx_cm = None; dy_cm = None
+                                dy_cm = None
+                            dx_cm = None
+                            x_cm = None; y_cm = None
                             self.records.append({
                                 "t": t, "cx": cx, "cy": cy, "z_cm": None,
                                 "x_cm": x_cm, "y_cm": y_cm,
@@ -663,85 +730,42 @@ class ArucoTracker:
         if not self.records:
             print("⚠ Brak zapisanych rekordów – pomijam CSV/wykresy.")
             return
-        # records to DataFrame (słowniki → kolumny)
         df = pd.DataFrame(self.records)
-        # Uzupełnij dy_px jeśli nie było ustawione (wsteczna zgodność)
+        # Uzupełnij dy_px jeśli brak
         if "dy_px" not in df.columns:
             if self.first_center is not None:
                 df["dy_px"] = self.first_center[1] - df["cy"]
             else:
                 df["dy_px"] = 0.0
-        if "dx_px" not in df.columns:
-            if self.first_center is not None:
-                df["dx_px"] = df["cx"] - self.first_center[0]
-            else:
-                df["dx_px"] = 0.0
-        # Zapisy: CSV
+        # Zapis CSV (pełny zestaw kolumn)
         cols_order = [c for c in [
             "t","cx","cy","z_cm","x_cm","y_cm","dx_px","dy_px","dx_cm","dy_cm","source"
         ] if c in df.columns]
-        df.to_csv("positions_px.csv", index=False, columns=cols_order)
-        # Wykresy px
-        if "dx_px" in df.columns:
-            plt.figure(figsize=(8,4))
-            plt.plot(df["t"], df["dx_px"])
-            plt.axhline(0, linewidth=0.8)
-            plt.xlabel("Czas [s]"); plt.ylabel("Δx [px]")
-            plt.title("Wychylenie poziome markera")
-            plt.grid(True); plt.tight_layout()
-            plt.savefig("deflection_x_px.png", dpi=150)
-            plt.close()
+        df.to_csv(self.out_dir / "positions_px.csv", index=False, columns=cols_order)
+        # Wykres pionowy w pikselach
         plt.figure(figsize=(8,4))
         plt.plot(df["t"], df["dy_px"])
         plt.axhline(0, linewidth=0.8)
         plt.xlabel("Czas [s]"); plt.ylabel("Δy [px]")
-        plt.title("Wychylenie pionowe markera")
+        plt.title("Wychylenie pionowe [px]")
         plt.grid(True); plt.tight_layout()
-        plt.savefig("deflection_y_px.png", dpi=150)
+        plt.savefig(self.out_dir / "deflection_y_px.png", dpi=150)
         plt.close()
-        # zachowaj starą nazwę pliku dla zgodności – kopia Y
-        try:
-            import shutil
-            shutil.copyfile("deflection_y_px.png", "deflection_px.png")
-        except Exception:
-            pass
-        # Wykresy cm (tylko jeśli mamy obie kolumny)
-        has_cm = ("dx_cm" in df.columns and df["dx_cm"].notna().any()) or ("dy_cm" in df.columns and df["dy_cm"].notna().any())
-        if has_cm:
-            if "dx_cm" in df.columns and df["dx_cm"].notna().any():
-                plt.figure(figsize=(8,4))
-                plt.plot(df["t"], df["dx_cm"])
-                plt.axhline(0, linewidth=0.8)
-                plt.xlabel("Czas [s]"); plt.ylabel("Δx [cm]")
-                plt.title("Wychylenie poziome [cm]")
-                plt.grid(True); plt.tight_layout()
-                plt.savefig("deflection_x_cm.png", dpi=150)
-                plt.close()
-            if "dy_cm" in df.columns and df["dy_cm"].notna().any():
-                plt.figure(figsize=(8,4))
-                plt.plot(df["t"], df["dy_cm"])
-                plt.axhline(0, linewidth=0.8)
-                plt.xlabel("Czas [s]"); plt.ylabel("Δy [cm]")
-                plt.title("Wychylenie pionowe [cm]")
-                plt.grid(True); plt.tight_layout()
-                plt.savefig("deflection_y_cm.png", dpi=150)
-                plt.close()
-        # wykres Z, jeśli dostępny
-        if "z_cm" in df.columns and df["z_cm"].notna().any():
+        # Wykres pionowy w cm (jeśli dostępny)
+        if "dy_cm" in df.columns and df["dy_cm"].notna().any():
             plt.figure(figsize=(8,4))
-            plt.plot(df["t"], df["z_cm"])
-            plt.xlabel("Czas [s]"); plt.ylabel("Z [cm]")
-            plt.title("Przemieszczenie osi Z")
+            plt.plot(df["t"], df["dy_cm"])
+            plt.axhline(0, linewidth=0.8)
+            plt.xlabel("Czas [s]"); plt.ylabel("Δy [cm]")
+            plt.title("Wychylenie pionowe [cm]")
             plt.grid(True); plt.tight_layout()
-            plt.savefig("deflection_z_cm.png", dpi=150)
+            plt.savefig(self.out_dir / "deflection_y_cm.png", dpi=150)
             plt.close()
-        # Podsumowanie
-        saved = ["positions_px.csv","deflection_y_px.png"]
-        if os.path.exists("deflection_x_px.png"): saved.append("deflection_x_px.png")
-        if os.path.exists("deflection_x_cm.png"): saved.append("deflection_x_cm.png")
-        if os.path.exists("deflection_y_cm.png"): saved.append("deflection_y_cm.png")
-        if os.path.exists("deflection_z_cm.png"): saved.append("deflection_z_cm.png")
-        print("✔ Zapisano: " + ", ".join(saved))
+        saved = [self.out_dir / "positions_px.csv", self.out_dir / "deflection_y_px.png"]
+        p_cm = self.out_dir / "deflection_y_cm.png"
+        if p_cm.exists():
+            saved.append(p_cm)
+        print("✔ Zapisano: " + ", ".join(str(s) for s in saved))
 
 
 if __name__ == "__main__":
@@ -755,11 +779,17 @@ if __name__ == "__main__":
         print(f"❌ Brak / błąd kalibracji ({e}); kontynuuję bez niej")
         K, D = None, None
 
+    # ---------- katalog wyjściowy serii ----------
+    out_dir, series_num = _make_output_dir(SERIES_NO)
+    out_video_path = out_dir / OUT_VIDEO
+    print(f"📁 Folder wyników: {out_dir} (seria {series_num})")
+
     ArucoTracker(
         video_path=VIDEO_PATH,
         dict_name=ARUCO_DICT,
         marker_id=MARKER_ID,
-        out_path=OUT_VIDEO,
+        out_path=str(out_video_path),
         camera_matrix=K,
-        dist_coeffs=D
+        dist_coeffs=D,
+        out_dir=out_dir
     ).run()
