@@ -22,13 +22,13 @@ import sys, time
 from typing import List, Tuple, Dict
 
 # ------------ Ustawienia -------------
-VIDEO_PATH = "/Users/bartlomiejostasz/PYCH/nagrania/test.MOV"
+VIDEO_PATH = "/Users/bartlomiejostasz/PYCH/nagrania/12 pazdziernik niedziela rano /tescik.MOV"
 # plik kalibracyjny kamery (macierz K i dystorsja)
-CALIB_PATH = '/Users/bartlomiejostasz/PYCH/LOT/1:5.npz'
+CALIB_PATH = "/Users/bartlomiejostasz/PYCH/Generatorwzorca/serie_kalibracji/seria_062/pliki_kalibracji/charuco_calibration_with_distance.npz"
 ARUCO_DICT = "DICT_6X6_1000"   # ręcznie lub AUTO w przyszłości
 MARKER_ID  = 2                 # None = pierwszy wykryty
 OUT_VIDEO  = "out_annotated.mp4"
-MARKER_LEN_M = 0.04            # wymiar boku markera w metrach (tu: 4 cm)
+MARKER_LEN_M = 0.034          # wymiar boku markera w metrach (tu: 34 mm)
 # -------------------------------------
 
 # słowniki OpenCV
