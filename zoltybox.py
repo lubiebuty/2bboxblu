@@ -36,6 +36,10 @@ OUT_VIDEO  = "out_annotated.mp4"
 SERIES_NO = None  # numer serii; jeśli None, wybierze się automatycznie kolejny
 # MARKER_LEN_M = 0.034           # wymiar boku markera w metrach (tu: 3.4 cm)
 MARKER_LEN_M = 0.034           # wymiar boku markera w metrach (tu: 3.4 cm)
+# --- Skalowanie px→cm dla osi pionowej ---
+# Jeśli ustawisz stałą odległość (np. 3.0 m), wykres [cm] zachowa kształt [px].
+LOCK_PLANE_DISTANCE_M = 3.0   # None = brak blokady; licz z PnP. 3.0 = zawsze 3 m.
+CONST_SCALE_FROM_FIRST_N = 0   # Jeśli >0 i LOCK=None: po N klatkach z PnP policz medianę Z i zablokuj skalę
 # -------------------------------------
 
 # słowniki OpenCV
@@ -186,6 +190,14 @@ class ArucoTracker:
         else:
             self.fx = float(self.K[0, 0]) if self.K is not None else None
             self.fy = float(self.K[1, 1]) if self.K is not None else None
+
+        # --- Skala pionowa px→cm ---
+        self.scale_y_cm_per_px: float | None = None
+        self.scale_locked = False
+        self._z_samples: list[float] = []
+        if self.fy is not None and isinstance(LOCK_PLANE_DISTANCE_M, (int, float)) and LOCK_PLANE_DISTANCE_M is not None:
+            self.scale_y_cm_per_px = (float(LOCK_PLANE_DISTANCE_M) * 100.0) / self.fy
+            self.scale_locked = True
 
         # --- Lucas–Kanade (LK) fallback i ROI re-detect ---
         self.lk_active = False
@@ -482,6 +494,14 @@ class ArucoTracker:
                     # zapamiętaj ostatnią dobrą pozę do forward-fill
                     self.last_rvec, self.last_tvec = rvec0.copy(), tvec0.copy()
                     self.last_z_m = float(tvec0[2,0])
+                    # Auto-blokada skali z mediany Z z pierwszych N klatek (jeśli włączono)
+                    if (not self.scale_locked) and self.fy is not None and LOCK_PLANE_DISTANCE_M is None and CONST_SCALE_FROM_FIRST_N > 0:
+                        self._z_samples.append(self.last_z_m)
+                        if len(self._z_samples) >= CONST_SCALE_FROM_FIRST_N:
+                            z_med = float(np.median(self._z_samples))
+                            self.scale_y_cm_per_px = (z_med * 100.0) / self.fy
+                            self.scale_locked = True
+                            print(f"🔒 Zablokowano skalę Δy: {self.scale_y_cm_per_px:.6f} cm/px (Z_med={z_med:.3f} m)")
                     # ustaw referencję płaszczyzny przy pierwszej dobrej pozie
                     if self.ref_R is None or self.ref_t is None:
                         self.ref_R, _ = cv2.Rodrigues(rvec0)
@@ -534,8 +554,10 @@ class ArucoTracker:
                 # przemieszczenia w px (zgodnie z dotychczasową konwencją dla Y)
                 dx_px = cx - self.first_center[0]
                 dy_px = self.first_center[1] - cy
-                # przemieszczenie pionowe w cm liczone z geometrii obrazu (fy, Z)
-                if self.last_z_m is not None and self.fy is not None:
+                # przemieszczenie pionowe w cm: preferuj stałą skalę (LOCK), inaczej bieżące Z
+                if self.scale_y_cm_per_px is not None:
+                    dy_cm = dy_px * self.scale_y_cm_per_px
+                elif self.last_z_m is not None and self.fy is not None:
                     dy_cm = (dy_px / self.fy) * self.last_z_m * 100.0
                 else:
                     dy_cm = None
@@ -614,7 +636,9 @@ class ArucoTracker:
                                     self.first_center = (cx, cy)
                                 dx_px = cx - self.first_center[0]
                                 dy_px = self.first_center[1] - cy
-                                if self.last_z_m is not None and self.fy is not None:
+                                if self.scale_y_cm_per_px is not None:
+                                    dy_cm = dy_px * self.scale_y_cm_per_px
+                                elif self.last_z_m is not None and self.fy is not None:
                                     dy_cm = (dy_px / self.fy) * self.last_z_m * 100.0
                                 else:
                                     dy_cm = None
@@ -674,7 +698,9 @@ class ArucoTracker:
                                 self.first_center = (cx, cy)
                             dx_px = cx - self.first_center[0]
                             dy_px = self.first_center[1] - cy
-                            if self.last_z_m is not None and self.fy is not None:
+                            if self.scale_y_cm_per_px is not None:
+                                dy_cm = dy_px * self.scale_y_cm_per_px
+                            elif self.last_z_m is not None and self.fy is not None:
                                 dy_cm = (dy_px / self.fy) * self.last_z_m * 100.0
                             else:
                                 dy_cm = None
