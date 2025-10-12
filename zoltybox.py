@@ -23,10 +23,11 @@ from typing import List, Tuple, Dict, Any
 
 from datetime import datetime
 import shutil
+import io
 
 # ------------ Ustawienia -------------
 # ------------ Ustawienia -------------
-VIDEO_PATH = "/Users/bartlomiejostasz/PYCH/nagrania/12 pazdziernik niedziela rano /test long.MOV"
+VIDEO_PATH = "/Users/bartlomiejostasz/PYCH/nagrania/12 pazdziernik niedziela rano /tescik.MOV"
 # plik kalibracyjny kamery (macierz K i dystorsja)
 CALIB_PATH = '/Users/bartlomiejostasz/PYCH/nagrania/dane do kalibracji /charuco_calibration_with_distance.npz'
 ARUCO_DICT = "DICT_6X6_1000"   # ręcznie lub AUTO w przyszłości
@@ -40,6 +41,25 @@ MARKER_LEN_M = 0.034           # wymiar boku markera w metrach (tu: 3.4 cm)
 # Jeśli ustawisz stałą odległość (np. 3.0 m), wykres [cm] zachowa kształt [px].
 LOCK_PLANE_DISTANCE_M = 3.0   # None = brak blokady; licz z PnP. 3.0 = zawsze 3 m.
 CONST_SCALE_FROM_FIRST_N = 0   # Jeśli >0 i LOCK=None: po N klatkach z PnP policz medianę Z i zablokuj skalę
+# --- Wideo z wtopionym wykresem ---
+EMBED_PLOT_IN_VIDEO = True      # generuj drugi plik MP4 z wtopionym wykresem
+PLOT_UNIT_CM = True             # True: wykres w [cm], False: w [px]
+# --- Wideo z wtopionym wykresem ---
+PLOT_WIDTH_FRAC = 0.45          # szerokość wykresu jako ułamek szerokości klatki
+PLOT_MARGIN_PX = 10             # margines od krawędzi podczas nakładania
+# --- Układ side-by-side: wideo po lewej (pełna wysokość), wykres po prawej ---
+SIDE_BY_SIDE_LAYOUT = True       # włącz układ obok siebie
+RIGHT_PANEL_REL_WIDTH = 1.8      # szerokość prawego panelu ≈ szerokość wideo (1.0 = tyle co wideo)
+# wysokość paska HUD nad wykresem (piksele)
+# wysokość paska HUD nad wykresem (piksele)
+PLOT_HEADER_PX = 90
+HUD_TOP_PAD_PX = 14            # dodatkowy margines od gory dla czytelniejszego HUD
+# --- Nowe marginesy/layout dla prawego panelu ---
+TOP_MARGIN_PX = 40            # czarny margines na samej górze prawego panelu (bez tekstu)
+SPACER_PX = 15                # odstęp między HUD a wykresem
+# -------------------------------------
+PLOT_TOP_EXTRA_SHIFT_PX = 12    # dodatkowe przesunięcie wykresu w dół pod HUD
+BOTTOM_MARGIN_PX = 15           # dolny margines prawego panelu (piksele)
 # -------------------------------------
 
 # słowniki OpenCV
@@ -141,6 +161,7 @@ class ArucoTracker:
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self.writer = cv2.VideoWriter(out_path, fourcc, self.fps, (self.w, self.h))
+        self.annotated_path = Path(out_path)
 
         try:
             self.tracker = cv2.TrackerCSRT_create()
@@ -191,12 +212,16 @@ class ArucoTracker:
             self.fx = float(self.K[0, 0]) if self.K is not None else None
             self.fy = float(self.K[1, 1]) if self.K is not None else None
 
-        # --- Skala pionowa px→cm ---
+        # --- Skala px→cm (dla obu osi) ---
         self.scale_y_cm_per_px: float | None = None
+        self.scale_x_cm_per_px: float | None = None
         self.scale_locked = False
         self._z_samples: list[float] = []
-        if self.fy is not None and isinstance(LOCK_PLANE_DISTANCE_M, (int, float)) and LOCK_PLANE_DISTANCE_M is not None:
-            self.scale_y_cm_per_px = (float(LOCK_PLANE_DISTANCE_M) * 100.0) / self.fy
+        if (isinstance(LOCK_PLANE_DISTANCE_M, (int, float)) and LOCK_PLANE_DISTANCE_M is not None
+                and self.fx is not None and self.fy is not None):
+            zcm = float(LOCK_PLANE_DISTANCE_M) * 100.0
+            self.scale_y_cm_per_px = zcm / self.fy
+            self.scale_x_cm_per_px = zcm / self.fx
             self.scale_locked = True
 
         # --- Lucas–Kanade (LK) fallback i ROI re-detect ---
@@ -420,6 +445,221 @@ class ArucoTracker:
         dy = float((d.T @ e2).item()) * 100.0
         return dx, dy
 
+    def _create_plot_base(self, df: pd.DataFrame, total_duration: float, use_cm: bool = True):
+        """Zwraca (img_bgr, meta) bazowego wykresu oraz metadane odwzorowania.
+        meta zawiera: dokładne mappingi data→pixel, bbox osi, limity osi, serie danych.
+        """
+        t = df["t"].to_numpy().astype(float)
+        if use_cm and "dy_cm" in df.columns and df["dy_cm"].notna().any():
+            y_ser = df["dy_cm"].astype(float).ffill().fillna(0.0)
+            y_label = "Δy [cm]"; title = "Wychylenie pionowe [cm]"
+        else:
+            y_ser = df["dy_px"].astype(float).ffill().fillna(0.0)
+            y_label = "Δy [px]"; title = "Wychylenie pionowe [px]"
+        y = y_ser.to_numpy()
+        # Limity osi Y z małym zapasem
+        y_min = float(np.nanmin(y)); y_max = float(np.nanmax(y))
+        if not np.isfinite(y_min) or not np.isfinite(y_max):
+            y_min, y_max = -1.0, 1.0
+        if y_min == y_max:
+            y_min -= 1.0; y_max += 1.0
+        pad = 0.02*(y_max - y_min)
+        y_min -= pad; y_max += pad
+        t_min = 0.0
+        t_max = float(total_duration)
+        # Rysowanie figury
+        fig = plt.figure(figsize=(6,4), dpi=150)
+        ax = fig.add_subplot(111)
+        ax.plot(t, y)
+        ax.axhline(0, linewidth=0.8)
+        ax.set_xlim(t_min, t_max)
+        ax.set_ylim(y_min, y_max)
+        ax.set_xlabel("Czas [s]")
+        ax.set_ylabel(y_label)
+        ax.set_title(title, pad=16)  # większy odstęp od osi
+        ax.grid(True)
+        # Zostaw miejsce na tytuł: najpierw dopasuj, potem poluzuj górę
+        fig.tight_layout()
+        plt.subplots_adjust(top=0.90)
+        # Dorysuj i pobierz renderer (dokładne metryki w pikselach figury)
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        w, h = fig.canvas.get_width_height()
+        # Spróbuj pobrać obraz bezpośrednio z canvasu; jeśli się nie uda – fallback do PNG
+        try:
+            buf_rgba = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+            img_rgba = buf_rgba.reshape(h, w, 4)
+            img_bgr = cv2.cvtColor(img_rgba, cv2.COLOR_RGBA2BGR)
+            scale_w = scale_h = 1.0
+        except Exception:
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=fig.dpi)
+            buf.seek(0)
+            png = np.frombuffer(buf.getvalue(), dtype=np.uint8)
+            img_bgr = cv2.imdecode(png, cv2.IMREAD_COLOR)
+            h2, w2 = img_bgr.shape[:2]
+            scale_w = w2 / float(w)
+            scale_h = h2 / float(h)
+            w, h = w2, h2
+        # Dokładne odwzorowanie danych na piksele (użyj transData)
+        p00 = ax.transData.transform((t_min, y_min))  # (x at t_min, y at y_min)
+        p10 = ax.transData.transform((t_max, y_min))
+        p01 = ax.transData.transform((t_min, y_max))
+        # Matplotlib ma (0,0) w lewym-dolnym rogu; obraz OpenCV w lewym-górnym, więc odwracamy Y
+        data_x0 = float(p00[0]) * scale_w
+        data_x1 = float(p10[0]) * scale_w
+        data_y0 = (fig.bbox.y1 - float(p00[1])) * scale_h  # y dla y_min
+        data_y1 = (fig.bbox.y1 - float(p01[1])) * scale_h  # y dla y_max
+        # Zapisz też bbox osi (może się przydać do debugowania)
+        ax_bb = ax.get_window_extent(renderer=renderer)
+        x0 = int(ax_bb.x0 * scale_w); y0 = int((fig.bbox.y1 - ax_bb.y1) * scale_h)
+        x1 = int(ax_bb.x1 * scale_w); y1 = int((fig.bbox.y1 - ax_bb.y0) * scale_h)
+        plt.close(fig)
+        meta = {
+            "ax_x0": x0, "ax_y0": y0, "ax_x1": x1, "ax_y1": y1,
+            "data_x0": data_x0, "data_x1": data_x1, "data_y0": data_y0, "data_y1": data_y1,
+            "t_min": t_min, "t_max": t_max, "y_min": y_min, "y_max": y_max,
+            "use_cm": use_cm, "y_series": y, "t_series": t,
+        }
+        return img_bgr, meta
+
+    def _render_video_with_plot(self, df: pd.DataFrame, base_video_path: Path, out_path: Path, use_cm: bool = True):
+        cap = cv2.VideoCapture(str(base_video_path))
+        if not cap.isOpened():
+            print(f"⚠ Nie mogę otworzyć {base_video_path} do wstawienia wykresu.")
+            return
+        fps = cap.get(cv2.CAP_PROP_FPS) or self.fps
+        W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.get(cv2.CAP_PROP_FRAME_COUNT) else None
+        duration = (n_frames / fps) if n_frames else (df["t"].max() if len(df) else 0.0)
+
+        # szerokość prawego panelu i wyjściowy rozmiar klatki (side-by-side)
+        panel_w = max(300, int(RIGHT_PANEL_REL_WIDTH * W)) if SIDE_BY_SIDE_LAYOUT else max(100, int(PLOT_WIDTH_FRAC * W))
+        outW = W + panel_w if SIDE_BY_SIDE_LAYOUT else W
+        outH = H
+
+        # czcionka/HUD i dynamiczna wysokość bloku tekstu (4 linie)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale_txt = max(0.6, H / 720.0 * 0.8)
+        thick = max(1, int(round(scale_txt)))
+        (tw_tmp, th_tmp), _ = cv2.getTextSize("Ag", font, scale_txt, thick)
+        line_step = int(26 * scale_txt)  # zgodny z pętlą HUD
+        hud_block_h = PLOT_MARGIN_PX + 4 * line_step + PLOT_MARGIN_PX  # wewnętrzne marginesy HUD
+        header_y0 = TOP_MARGIN_PX                                      # początek HUD pod górnym marginesem
+        header_y1 = header_y0 + hud_block_h                            # koniec HUD
+
+        # bazowy wykres i metadane (przeskalujemy do prawego panelu)
+        plot_img, meta = self._create_plot_base(df, duration, use_cm=use_cm)
+
+        # rozmiar obszaru na wykres: prawa strona, pod HUD, z 15 px odstępem i 15 px dołu
+        target_w = panel_w - 2 * PLOT_MARGIN_PX
+        target_h = H - header_y1 - SPACER_PX - PLOT_TOP_EXTRA_SHIFT_PX - BOTTOM_MARGIN_PX
+        target_w = max(50, target_w)
+        target_h = max(50, target_h)
+        # skalowanie – PRIORYTET WYSOKOŚĆ: dopasuj do target_h; jeśli szerokość by przekroczyła panel, ogranicz szerokość
+        base_h, base_w = plot_img.shape[:2]
+        scale = target_h / max(1, base_h)
+        plot_w = int(round(base_w * scale))
+        plot_h = int(round(base_h * scale))
+        if plot_w > target_w:
+            scale = target_w / max(1, base_w)
+            plot_w = int(round(base_w * scale))
+            plot_h = int(round(base_h * scale))
+        scale_used = scale
+        plot_resized = cv2.resize(plot_img, (plot_w, plot_h), interpolation=cv2.INTER_AREA)
+
+        # pobierz limity i serie oraz mappingi data→pixel
+        t_min = meta["t_min"]; t_max = max(meta["t_max"], 1e-6)
+        y_min = meta["y_min"]; y_max = meta["y_max"]
+        t_series = np.asarray(meta["t_series"], dtype=float)
+        y_series = np.asarray(meta["y_series"], dtype=float)
+
+        # writer na powiększony kadr (wideo + panel)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(out_path), fourcc, fps, (outW, outH))
+
+        i = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            t = i / fps
+            i += 1
+
+            # znajdź wartość dla czasu t (forward-fill)
+            idx = np.searchsorted(t_series, t, side='right') - 1
+            if idx < 0: idx = 0
+            if idx >= len(y_series): idx = len(y_series) - 1
+            y_val = float(y_series[idx]) if len(y_series) else 0.0
+
+            # przygotuj canvas wyjściowy: lewa strona oryginalna klatka, prawa panel
+            canvas = np.zeros((outH, outW, 3), dtype=np.uint8)
+            canvas[:, :W] = frame
+            x_panel = W
+            # cały panel ciemny; HUD zaczyna się dopiero pod TOP_MARGIN_PX
+            cv2.rectangle(canvas, (x_panel, 0), (x_panel + panel_w, outH), (20, 20, 20), -1)
+            # pas HUD (dla czytelności lekko jaśniejszy)
+            cv2.rectangle(canvas, (x_panel, header_y0), (x_panel + panel_w, header_y1), (30, 30, 30), -1)
+
+            # HUD: czas, klatka, pozycja (x,y), wychylenia Δx/Δy w px/mm/cm
+            cx_val = float(df["cx"].iloc[idx]) if "cx" in df.columns and len(df) else 0.0
+            cy_val = float(df["cy"].iloc[idx]) if "cy" in df.columns and len(df) else 0.0
+            dx_px_val = float(df["dx_px"].iloc[idx]) if "dx_px" in df.columns and len(df) else (cx_val - (self.first_center[0] if self.first_center else cx_val))
+            dy_px_val = float(df["dy_px"].iloc[idx]) if "dy_px" in df.columns and len(df) else (self.first_center[1] if self.first_center else cy_val) - cy_val
+            # Y w cm/mm
+            if use_cm and "dy_cm" in df.columns and df["dy_cm"].notna().any():
+                dy_cm_val = float(df["dy_cm"].iloc[idx])
+            else:
+                if getattr(self, "scale_y_cm_per_px", None) is not None:
+                    dy_cm_val = dy_px_val * float(self.scale_y_cm_per_px)
+                else:
+                    dy_cm_val = np.nan
+            dy_mm_val = dy_cm_val * 10.0 if np.isfinite(dy_cm_val) else np.nan
+            # X w cm/mm
+            if getattr(self, "scale_x_cm_per_px", None) is not None:
+                dx_cm_val = dx_px_val * float(self.scale_x_cm_per_px)
+            elif getattr(self, "scale_y_cm_per_px", None) is not None and self.fx is not None and self.fy is not None:
+                dx_cm_val = dx_px_val * float(self.scale_y_cm_per_px) * (self.fy / self.fx)
+            else:
+                dx_cm_val = np.nan
+            dx_mm_val = dx_cm_val * 10.0 if np.isfinite(dx_cm_val) else np.nan
+
+            hud_lines = [
+                f"t={t:6.2f}s  frame={i-1}",
+                f"pos: x={cx_val:7.1f} px,  y={cy_val:7.1f} px",
+                (f"Δy: {dy_px_val:7.1f} px  |  {dy_mm_val:7.1f} mm  |  {dy_cm_val:7.2f} cm" if np.isfinite(dy_cm_val)
+                 else f"Δy: {dy_px_val:7.1f} px  |   n/a mm  |   n/a cm"),
+                (f"Δx: {dx_px_val:7.1f} px  |  {dx_mm_val:7.1f} mm  |  {dx_cm_val:7.2f} cm" if np.isfinite(dx_cm_val)
+                 else f"Δx: {dx_px_val:7.1f} px  |   n/a mm  |   n/a cm"),
+            ]
+            # start tekstu tuż pod górnym marginesem wewnątrz bloku HUD
+            ty = header_y0 + PLOT_MARGIN_PX + th_tmp
+            for line in hud_lines:
+                cv2.putText(canvas, line, (x_panel + PLOT_MARGIN_PX, ty), font, scale_txt, (230, 230, 230), thick, cv2.LINE_AA)
+                ty += line_step
+
+            ox = x_panel + PLOT_MARGIN_PX
+            oy = header_y1 + SPACER_PX + PLOT_TOP_EXTRA_SHIFT_PX
+            w_avail = panel_w - 2 * PLOT_MARGIN_PX
+            h_avail = outH - BOTTOM_MARGIN_PX - oy
+            w_clip = min(plot_w, w_avail)
+            h_clip = min(plot_h, h_avail)
+            canvas[oy:oy+h_clip, ox:ox+w_clip] = plot_resized[:h_clip, :w_clip]
+
+            # czerwony wskaźnik na wykresie – dokładny mapping transData (po skalowaniu i przesunięciu)
+            dx0 = meta["data_x0"]; dx1 = meta["data_x1"]
+            dy0 = meta["data_y0"]; dy1 = meta["data_y1"]
+            # liniowe odwzorowanie danych → piksele w obrazie wykresu
+            px_rel = dx0 + (t - t_min) * (dx1 - dx0) / (t_max - t_min + 1e-12)
+            py_rel = dy0 + (y_val - y_min) * (dy1 - dy0) / (y_max - y_min + 1e-12)
+            px_dot = int(ox + scale_used * px_rel)
+            py_dot = int(oy + scale_used * py_rel)
+            cv2.circle(canvas, (px_dot, py_dot), 8, (0, 0, 255), -1)
+
+            writer.write(canvas)
+        cap.release(); writer.release()
+        print(f"✔ Zapisano wideo z wykresem: {out_path}")
+
     def run(self) -> None:
         frame_idx = 0
         start = time.time()
@@ -495,13 +735,14 @@ class ArucoTracker:
                     self.last_rvec, self.last_tvec = rvec0.copy(), tvec0.copy()
                     self.last_z_m = float(tvec0[2,0])
                     # Auto-blokada skali z mediany Z z pierwszych N klatek (jeśli włączono)
-                    if (not self.scale_locked) and self.fy is not None and LOCK_PLANE_DISTANCE_M is None and CONST_SCALE_FROM_FIRST_N > 0:
+                    if (not self.scale_locked) and (self.fx is not None) and (self.fy is not None) and LOCK_PLANE_DISTANCE_M is None and CONST_SCALE_FROM_FIRST_N > 0:
                         self._z_samples.append(self.last_z_m)
                         if len(self._z_samples) >= CONST_SCALE_FROM_FIRST_N:
                             z_med = float(np.median(self._z_samples))
                             self.scale_y_cm_per_px = (z_med * 100.0) / self.fy
+                            self.scale_x_cm_per_px = (z_med * 100.0) / self.fx
                             self.scale_locked = True
-                            print(f"🔒 Zablokowano skalę Δy: {self.scale_y_cm_per_px:.6f} cm/px (Z_med={z_med:.3f} m)")
+                            print(f"🔒 Zablokowano skalę: Δy={self.scale_y_cm_per_px:.6f} cm/px, Δx={self.scale_x_cm_per_px:.6f} cm/px (Z_med={z_med:.3f} m)")
                     # ustaw referencję płaszczyzny przy pierwszej dobrej pozie
                     if self.ref_R is None or self.ref_t is None:
                         self.ref_R, _ = cv2.Rodrigues(rvec0)
@@ -787,10 +1028,21 @@ class ArucoTracker:
             plt.grid(True); plt.tight_layout()
             plt.savefig(self.out_dir / "deflection_y_cm.png", dpi=150)
             plt.close()
+        # --- Wideo z wtopionym wykresem (drugi plik) ---
+        if EMBED_PLOT_IN_VIDEO:
+            try:
+                base_mp4 = self.annotated_path
+                out_plot_mp4 = self.out_dir / (self.annotated_path.stem + "_with_plot.mp4")
+                self._render_video_with_plot(df, base_mp4, out_plot_mp4, use_cm=PLOT_UNIT_CM)
+            except Exception as e:
+                print(f"⚠ Nie udało się wygenerować wideo z wykresem: {e}")
         saved = [self.out_dir / "positions_px.csv", self.out_dir / "deflection_y_px.png"]
         p_cm = self.out_dir / "deflection_y_cm.png"
+        p_vid = self.out_dir / (self.annotated_path.stem + "_with_plot.mp4")
         if p_cm.exists():
             saved.append(p_cm)
+        if p_vid.exists():
+            saved.append(p_vid)
         print("✔ Zapisano: " + ", ".join(str(s) for s in saved))
 
 
